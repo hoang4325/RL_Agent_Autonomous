@@ -1,0 +1,57 @@
+scenario:
+  episode_seconds: 45
+  max_steps: 900
+  target_speed_kmh: 35
+  action_repeat: 2
+curriculum:
+  enabled: true
+  stages:
+  - name: stabilize
+    num_vehicles: 0
+    num_walkers: 0
+    min_speed_kmh: 20
+    max_speed_kmh: 30
+  - name: easy
+    num_vehicles: 10
+    num_walkers: 5
+    min_speed_kmh: 20
+    max_speed_kmh: 40
+  - name: medium
+    num_vehicles: 25
+    num_walkers: 15
+    min_speed_kmh: 15
+    max_speed_kmh: 50
+  - name: hard
+    num_vehicles: 45
+    num_walkers: 30
+    min_speed_kmh: 10
+    max_speed_kmh: 60
+  episodes_per_stage: 120
+reward:
+  progress_w: 1.0
+  lane_w: 0.6
+  heading_w: 0.3
+  speed_w: 0.05
+  ttc_w: 0.2
+  collision_penalty: 100.0
+  red_light_penalty: 60.0
+  lane_invasion_penalty: 8.0
+  idle_penalty: 0.02
+  reward_scale: 1.0
+  reward_clip_abs: 10.0
+  unsafe_action_penalty: 1.0
+  red_light_action_penalty: 1.0
+  ttc_action_penalty: 0.5
+  lane_change_penalty: 0.02
+done:
+  max_lane_dev_m: 2.2
+  stuck_seconds: 8
+shield:
+  enabled: true
+  red_light_dist_m: 20.0
+  ttc_stop_s: 1.5
+  front_gap_stop_m: 6.0
+  lane_change_min_front_gap_m: 12.0
+  lane_change_min_rear_gap_m: 8.0
+  lane_change_min_ttc_s: 3.0
+  override_to: STOP

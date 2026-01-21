@@ -1,0 +1,36 @@
+carla:
+  host: "127.0.0.1"
+  port: 2000
+  timeout_s: 120.0
+  town: "Town10HD"
+
+world:
+  town: "Town10HD"
+  synchronous_mode: true
+  fixed_delta_seconds: 0.1
+  max_substeps: 0
+  no_rendering_mode: true
+
+spawn:
+  vehicle_blueprint: "vehicle.tesla.model3"
+  spawn_point: "random"
+
+traffic:
+  enabled: true
+  seed: 1337
+  vehicles: 15
+  walkers: 0
+  hybrid_physics_mode: true
+  global_distance_to_leading_vehicle: 2.5
+  respawn_dormant_vehicles: false
+
+episode:
+  max_seconds: 45
+  stuck_timeout_s: 8
+
+ego:
+  vehicle_blueprint: "vehicle.tesla.model3"
+  spawn_point: "random" # hoặc "fixed:12" nếu bạn muốn cố định
+  role_name: "hero"
+  autopilot: false
+  respawn_on_reset: true

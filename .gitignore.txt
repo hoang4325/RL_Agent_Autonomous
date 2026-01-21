@@ -1,0 +1,39 @@
+# ==== Python ====
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.env
+.venv
+venv/
+
+# ==== Conda ====
+.conda/
+*.conda
+
+# ==== CARLA ====
+CarlaUE4/
+*.log
+*.tmp
+*.bak
+*.sav
+
+# ==== RL / Training ====
+runs/
+logs/
+tensorboard/
+checkpoints/
+*.zip
+*.pt
+*.pth
+*.onnx
+
+# ==== Dataset / Cache ====
+data/
+cache/
+*.npy
+
+# ==== OS ====
+.DS_Store
+Thumbs.db

@@ -1,0 +1,61 @@
+# config/rl.yaml
+rl:
+  algorithm: "PPO"
+  policy: "MultiInputPolicy"
+  total_timesteps: 1000000
+  seed: 0
+
+obs:
+  use_bev: true
+  bev:
+    size: 96
+    meters_per_cell: 0.5
+    channels:
+      - "drivable"
+      - "obstacles"
+      - "velocity_x"
+      - "velocity_y"
+      - "route"
+
+ppo:
+  # CARLA thường ổn định hơn khi update thường xuyên hơn
+  n_steps: 1024
+  batch_size: 256
+
+  gamma: 0.99
+  gae_lambda: 0.95
+
+  # Giảm LR để critic bớt "văng"
+  learning_rate: 0.0001
+
+  # Thêm exploration (ent_coef=0 dễ bị "cứng" sớm)
+  ent_coef: 0.01
+
+  clip_range: 0.2
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+
+logging:
+  tensorboard_log: "runs"
+  checkpoint_dir: "checkpoints"
+  save_every_steps: 50000
+
+normalize:
+  enabled: true
+  clip_obs: 10.0
+  clip_reward: 10.0
+  norm_obs_keys: ["vec"]
+
+eval:
+  enabled: true
+  eval_freq: 10000
+  n_eval_episodes: 5
+  deterministic: true
+
+obs:
+  use_bev: true
+  bev:
+    size: 96
+    meters_per_cell: 0.5
+    v_ref_mps: 10.0        # ~36 km/h, hoặc bỏ để auto theo target_speed
+    point_radius: 1        # 1 -> 3x3, 2 -> 5x5

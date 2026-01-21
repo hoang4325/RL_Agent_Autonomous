@@ -1,0 +1,14 @@
+# Core
+numpy>=1.23
+scipy>=1.10
+PyYAML>=6.0
+
+# RL
+gymnasium>=0.29
+stable-baselines3[extra]>=2.3.0
+
+# Optional (visual debug)
+opencv-python>=4.8
+
+# CARLA PythonAPI is NOT installed via pip reliably on Windows.
+# Use the matching .egg from your CARLA_0.9.15/PythonAPI/carla/dist and add to PYTHONPATH.
