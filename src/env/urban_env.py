@@ -1,3 +1,4 @@
+# src/env/urban_env.py
 from __future__ import annotations
 
 import math
@@ -57,7 +58,12 @@ class CarlaUrbanEnv(gym.Env):
 
     Obs is Dict:
       - vec: float vector features (normalized to [-1, 1])
-      - bev: (C,H,W) BEV tensor (optional), expected in [-1,1] (vel) and [0,1] masks
+      - bev: (C,H,W) BEV tensor (optional)
+
+    IMPORTANT:
+      compute_gap_features() returns front_rel_speed with convention:
+        front_rel_speed = front_speed - ego_speed
+      so "closing" means front_rel_speed < 0 (ego faster than front).
     """
 
     metadata = {"render_modes": []}
@@ -79,13 +85,20 @@ class CarlaUrbanEnv(gym.Env):
         scenarios_config_path: str = "config/scenarios.yaml",
         rl_config_path: str = "config/rl.yaml",
         seed: int = 0,
+        disable_shield: bool = False,
     ):
         super().__init__()
+
+        if carla is None:
+            raise RuntimeError("CARLA Python API not available. Please ensure 'carla' is importable.")
 
         self.carla_cfg = load_yaml(carla_config_path)
         self.sensors_cfg = load_yaml(sensors_config_path)
         self.scenarios_cfg = load_yaml(scenarios_config_path)
         self.rl_cfg = load_yaml(rl_config_path)
+
+        # unified flag (used by shield and reward)
+        self.disable_shield = bool(disable_shield)
 
         self.rng = random.Random(seed)
         np.random.seed(seed)
@@ -101,7 +114,6 @@ class CarlaUrbanEnv(gym.Env):
         target_kmh = float(self.scenarios_cfg.get("scenario", {}).get("target_speed_kmh", 35))
         v_ref_default = max(5.0, target_kmh / 3.6)  # m/s
         v_ref_mps = float(bev_cfg.get("v_ref_mps", v_ref_default))
-
         point_radius = int(bev_cfg.get("point_radius", 1))
 
         # NOTE: must match your bev_builder.py
@@ -119,7 +131,6 @@ class CarlaUrbanEnv(gym.Env):
             {"vec": spaces.Box(low=-1.0, high=1.0, shape=(self.vec_dim,), dtype=np.float32)}
         )
 
-        # IMPORTANT: with your patched bev_builder.py, BEV stays within [-1,1]
         if self.use_bev:
             self.observation_space.spaces["bev"] = spaces.Box(
                 low=-1.0,
@@ -174,12 +185,23 @@ class CarlaUrbanEnv(gym.Env):
         # GNSS origin (to avoid huge lat/lon magnitudes in obs)
         self._gnss_origin = None  # (lat, lon, alt)
 
-        # keep last sensor features so obs doesn't jump to 999 when a frame is missed
+        # keep last sensor features so obs doesn't jump when a frame is missed
         self._last_misc = np.zeros(16, dtype=np.float32)
+
         # cache last raw vec (before normalization) for shield/reward shaping
         self._last_vec_raw = np.zeros(30, dtype=np.float32)
-        self._last_action = 0
+
+        # last action bookkeeping (for reward shaping + debug)
+        self._last_action = 0  # proposed (policy output)
         self._last_action_overridden = False
+        self._last_proposed_action: int = 0
+        self._last_executed_action: int = 0
+        self._last_action_override_reason: str = ""
+
+        # last control for eval debug
+        self._last_control = None
+
+        # defaults when sensors missing
         self._last_misc[1] = 50.0  # depth_center_min_m
         self._last_misc[3] = 50.0  # radar_min_range_m
 
@@ -191,7 +213,19 @@ class CarlaUrbanEnv(gym.Env):
         self._episode_count = 0
         self._curr_stage: Optional[Dict[str, Any]] = None
 
+        # ---- behavior shaping state (NEW) ----
+        self._prev_lane_id: Optional[int] = None
+        self._blocked_time: float = 0.0
+        self._last_front_gap: float = 999.0
+        self._lead_vehicle: Optional["carla.Vehicle"] = None
+
         self._connect_world()
+
+    # -------------------- helpers --------------------
+    def _safe_action_name(self, a: int) -> str:
+        a = int(a)
+        a = max(0, min(a, len(self.ACTIONS) - 1))
+        return self.ACTIONS[a]
 
     # -------------------- world setup --------------------
     def _connect_world(self) -> None:
@@ -210,8 +244,35 @@ class CarlaUrbanEnv(gym.Env):
         tm_port = int(self.carla_cfg.get("traffic", {}).get("tm_port", 8000))
         self.tm = self.client.get_trafficmanager(tm_port)
         self.tm.set_synchronous_mode(True)
-        if bool(self.carla_cfg.get("traffic", {}).get("hybrid_physics", True)):
-            self.tm.set_hybrid_physics_mode(True)
+
+        t_cfg = self.carla_cfg.get("traffic", {}) or {}
+        hybrid = t_cfg.get("hybrid_physics", None)
+        if hybrid is None:
+            hybrid = t_cfg.get("hybrid_physics_mode", True)
+        if bool(hybrid) and hasattr(self.tm, "set_hybrid_physics_mode"):
+            try:
+                self.tm.set_hybrid_physics_mode(True)
+            except Exception:
+                pass
+
+        # Apply TM knobs if provided
+        if "seed" in t_cfg and hasattr(self.tm, "set_random_device_seed"):
+            try:
+                self.tm.set_random_device_seed(int(t_cfg["seed"]))
+            except Exception:
+                pass
+
+        if "global_distance_to_leading_vehicle" in t_cfg and hasattr(self.tm, "global_distance_to_leading_vehicle"):
+            try:
+                self.tm.global_distance_to_leading_vehicle(float(t_cfg["global_distance_to_leading_vehicle"]))
+            except Exception:
+                pass
+
+        if "respawn_dormant_vehicles" in t_cfg and hasattr(self.tm, "set_respawn_dormant_vehicles"):
+            try:
+                self.tm.set_respawn_dormant_vehicles(bool(t_cfg["respawn_dormant_vehicles"]))
+            except Exception:
+                pass
 
         # warmup
         warm = int(self.carla_cfg.get("runtime", {}).get("warmup_ticks", 10))
@@ -266,14 +327,19 @@ class CarlaUrbanEnv(gym.Env):
             return
         assert self.world is not None and self.tm is not None
 
-        t_cfg = self.carla_cfg.get("traffic", {})
+        t_cfg = self.carla_cfg.get("traffic", {}) or {}
         stage = self._curr_stage
+
+        # support both keys: vehicles/walkers and num_vehicles/num_walkers
+        base_veh = t_cfg.get("vehicles", t_cfg.get("num_vehicles", 25))
+        base_walk = t_cfg.get("walkers", t_cfg.get("num_walkers", 15))
+
         if stage is not None:
-            num_veh = int(stage.get("num_vehicles", t_cfg.get("num_vehicles", t_cfg.get("vehicles", 25))))
-            num_walk = int(stage.get("num_walkers", t_cfg.get("num_walkers", t_cfg.get("walkers", 15))))
+            num_veh = int(stage.get("num_vehicles", base_veh))
+            num_walk = int(stage.get("num_walkers", base_walk))
         else:
-            num_veh = int(t_cfg.get("num_vehicles", t_cfg.get("vehicles", 25)))
-            num_walk = int(t_cfg.get("num_walkers", t_cfg.get("walkers", 15)))
+            num_veh = int(base_veh)
+            num_walk = int(base_walk)
 
         bp_lib = self.world.get_blueprint_library()
         veh_bps = bp_lib.filter("vehicle.*")
@@ -292,18 +358,22 @@ class CarlaUrbanEnv(gym.Env):
             except Exception:
                 continue
 
-        # walkers
+        # walkers (optional)
+        if num_walk <= 0:
+            return
+
         try:
             walker_bps = bp_lib.filter("walker.pedestrian.*")
             controller_bp = bp_lib.find("controller.ai.walker")
-            walker_spawn = []
+
+            walker_spawn: List["carla.Transform"] = []
             for _ in range(num_walk):
                 loc = self.world.get_random_location_from_navigation()
                 if loc is None:
                     continue
                 walker_spawn.append(carla.Transform(loc))
 
-            walkers = []
+            walkers: List["carla.Actor"] = []
             for sp in walker_spawn:
                 bp = self.rng.choice(walker_bps)
                 w = self.world.try_spawn_actor(bp, sp)
@@ -321,6 +391,79 @@ class CarlaUrbanEnv(gym.Env):
         except Exception:
             pass
 
+    def _spawn_lead_vehicle(self, distance_m: float = 20.0, slow_pct: float = 60.0) -> None:
+        """
+        Spawn a slow vehicle ahead of ego on the same lane to force overtaking/lane-change scenarios.
+        - distance_m: spawn lead ~distance ahead
+        - slow_pct: TrafficManager speed difference % (higher => slower)
+        """
+        if not bool(self.carla_cfg.get("traffic", {}).get("enabled", True)):
+            return
+        assert self.world is not None and self.map is not None and self.tm is not None and self.ego is not None
+
+        # Optional config hook
+        lv_cfg = (self.scenarios_cfg.get("lead_vehicle", {}) or {})
+        if "enabled" in lv_cfg and not bool(lv_cfg.get("enabled", True)):
+            return
+        distance_m = float(lv_cfg.get("distance_m", distance_m))
+        slow_pct = float(lv_cfg.get("slow_pct", slow_pct))
+
+        ego_tf = self.ego.get_transform()
+        ego_wp = self.map.get_waypoint(ego_tf.location, project_to_road=True, lane_type=carla.LaneType.Driving)
+        if ego_wp is None:
+            return
+
+        nxt = ego_wp.next(max(10.0, distance_m))
+        if not nxt:
+            return
+        lead_wp = nxt[0]
+
+        bp_lib = self.world.get_blueprint_library()
+        veh_bps = bp_lib.filter("vehicle.*")
+        if not veh_bps:
+            return
+
+        lead = None
+        for _ in range(10):
+            bp = self.rng.choice(veh_bps)
+            try:
+                lead = self.world.try_spawn_actor(bp, lead_wp.transform)
+            except Exception:
+                lead = None
+            if lead is not None:
+                break
+            try:
+                self.world.tick()
+            except Exception:
+                pass
+
+        if lead is None:
+            return
+
+        try:
+            lead.set_autopilot(True, self.tm.get_port())
+        except Exception:
+            pass
+
+        # Slow down lead
+        if hasattr(self.tm, "vehicle_percentage_speed_difference"):
+            try:
+                self.tm.vehicle_percentage_speed_difference(lead, float(slow_pct))
+            except Exception:
+                pass
+
+        # Make it keep some distance (smoother)
+        t_cfg = self.carla_cfg.get("traffic", {}) or {}
+        base_dist = float(t_cfg.get("global_distance_to_leading_vehicle", 4.0))
+        if hasattr(self.tm, "distance_to_leading_vehicle"):
+            try:
+                self.tm.distance_to_leading_vehicle(lead, max(4.0, base_dist))
+            except Exception:
+                pass
+
+        self._lead_vehicle = lead
+        self.npc_actors.append(lead)
+
     def _spawn_sensors(self) -> None:
         assert self.world is not None and self.ego is not None
         self.sensor_mgr = SensorManager(self.world, self.ego, self.sensors_cfg)
@@ -336,6 +479,14 @@ class CarlaUrbanEnv(gym.Env):
             self.sensor_mgr.stop_destroy()
             self.sensor_mgr = None
 
+        # destroy lead vehicle if any
+        if self._lead_vehicle is not None:
+            try:
+                self._lead_vehicle.destroy()
+            except Exception:
+                pass
+            self._lead_vehicle = None
+
         destroy_actors(self.npc_actors)
         self.npc_actors = []
         destroy_actors(self.actors)
@@ -349,11 +500,11 @@ class CarlaUrbanEnv(gym.Env):
         self.collision_happened = False
         self.lane_invasion_happened = False
 
-        # curriculum: select stage based on current episode_count, then increment
+        # curriculum
         self._curr_stage = self._select_curriculum_stage()
         self._episode_count += 1
 
-        # Curriculum can optionally randomize target speed per episode (stability -> diversity)
+        # Curriculum can optionally randomize target speed per episode
         if self._curr_stage is not None:
             mn = float(self._curr_stage.get("min_speed_kmh", self.target_speed_kmh))
             mx = float(self._curr_stage.get("max_speed_kmh", self.target_speed_kmh))
@@ -365,6 +516,9 @@ class CarlaUrbanEnv(gym.Env):
         self._spawn_ego()
         self._spawn_sensors()
         self._spawn_traffic()
+
+        # NEW: force a slow lead vehicle to create lane-change/overtake situations
+        self._spawn_lead_vehicle(distance_m=20.0, slow_pct=60.0)
 
         assert self.world is not None
         for _ in range(10):
@@ -390,6 +544,18 @@ class CarlaUrbanEnv(gym.Env):
 
         self._last_tl_red = 0.0
         self._last_tl_dist = 999.0
+
+        # reset debug cache
+        self._last_action_overridden = False
+        self._last_action_override_reason = ""
+        self._last_proposed_action = 0
+        self._last_executed_action = 0
+        self._last_control = None
+
+        # behavior shaping cache reset
+        self._prev_lane_id = None
+        self._blocked_time = 0.0
+        self._last_front_gap = 999.0
 
         obs = self._get_observation()
         info: Dict[str, Any] = {}
@@ -463,7 +629,9 @@ class CarlaUrbanEnv(gym.Env):
         imu = pop("imu", 0.05)
         if imu is not None:
             try:
-                imu_ax, imu_ay, imu_az = float(imu.accelerometer.x), float(imu.accelerometer.y), float(imu.accelerometer.z)
+                imu_ax, imu_ay, imu_az = float(imu.accelerometer.x), float(imu.accelerometer.y), float(
+                    imu.accelerometer.z
+                )
                 imu_gx, imu_gy, imu_gz = float(imu.gyroscope.x), float(imu.gyroscope.y), float(imu.gyroscope.z)
                 imu_compass = float(getattr(imu, "compass", imu_compass))
             except Exception:
@@ -523,38 +691,38 @@ class CarlaUrbanEnv(gym.Env):
         v = vec.astype(np.float32).copy()
 
         # base_vec indices
-        v[0] = np.clip(v[0] / 20.0, 0.0, 1.5)          # speed m/s
-        v[1] = np.clip(v[1] / 3.0, 0.0, 3.0)           # lane_dist m
-        v[2] = np.clip(v[2] / math.pi, -1.0, 1.0)      # heading_err rad/pi
+        v[0] = np.clip(v[0] / 20.0, 0.0, 1.5)  # speed m/s
+        v[1] = np.clip(v[1] / 3.0, 0.0, 3.0)  # lane_dist m
+        v[2] = np.clip(v[2] / math.pi, -1.0, 1.0)  # heading_err rad/pi
 
         # 3-5 tl onehot stay 0/1
 
-        v[6] = np.clip(v[6] / 50.0, 0.0, 1.0)          # tl_dist
-        v[7] = np.clip(v[7] / 50.0, 0.0, 1.0)          # front_gap
-        v[8] = np.clip(v[8] / 20.0, -1.0, 1.0)         # front_rel_speed
+        v[6] = np.clip(v[6] / 50.0, 0.0, 1.0)  # tl_dist
+        v[7] = np.clip(v[7] / 50.0, 0.0, 1.0)  # front_gap
+        v[8] = np.clip(v[8] / 20.0, -1.0, 1.0)  # front_rel_speed
 
-        for i in (9, 10, 11, 12):                      # gaps
+        for i in (9, 10, 11, 12):  # gaps
             v[i] = np.clip(v[i] / 50.0, 0.0, 1.0)
 
-        v[13] = np.clip(v[13] / 10.0, 0.0, 1.0)        # min_ttc
+        v[13] = np.clip(v[13] / 10.0, 0.0, 1.0)  # min_ttc
 
         off = 14
-        v[off + 0] = np.clip(v[off + 0], 0.0, 1.0)              # brightness
-        v[off + 1] = np.clip(v[off + 1] / 50.0, 0.0, 1.0)       # depth
-        v[off + 2] = np.clip(v[off + 2], 0.0, 1.0)              # sem_ratio
-        v[off + 3] = np.clip(v[off + 3] / 50.0, 0.0, 1.0)       # radar_min_r
-        v[off + 4] = np.clip(v[off + 4] / 20.0, -1.0, 1.0)      # radar_min_v
-        v[off + 5] = np.clip(v[off + 5] / 50.0, 0.0, 1.0)       # radar_count
+        v[off + 0] = np.clip(v[off + 0], 0.0, 1.0)  # brightness
+        v[off + 1] = np.clip(v[off + 1] / 50.0, 0.0, 1.0)  # depth
+        v[off + 2] = np.clip(v[off + 2], 0.0, 1.0)  # sem_ratio
+        v[off + 3] = np.clip(v[off + 3] / 50.0, 0.0, 1.0)  # radar_min_r
+        v[off + 4] = np.clip(v[off + 4] / 20.0, -1.0, 1.0)  # radar_min_v
+        v[off + 5] = np.clip(v[off + 5] / 50.0, 0.0, 1.0)  # radar_count
 
-        for j in range(off + 6, off + 9):                       # imu accel
+        for j in range(off + 6, off + 9):  # imu accel
             v[j] = np.clip(v[j] / 10.0, -1.0, 1.0)
-        for j in range(off + 9, off + 12):                      # imu gyro
+        for j in range(off + 9, off + 12):  # imu gyro
             v[j] = np.clip(v[j] / 5.0, -1.0, 1.0)
 
-        v[off + 12] = np.clip(v[off + 12] / math.pi, -1.0, 1.0) # compass
-        v[off + 13] = np.clip(v[off + 13] / 1e-3, -1.0, 1.0)    # dlat
-        v[off + 14] = np.clip(v[off + 14] / 1e-3, -1.0, 1.0)    # dlon
-        v[off + 15] = np.clip(v[off + 15] / 50.0, -1.0, 1.0)    # dalt
+        v[off + 12] = np.clip(v[off + 12] / math.pi, -1.0, 1.0)  # compass
+        v[off + 13] = np.clip(v[off + 13] / 1e-3, -1.0, 1.0)  # dlat
+        v[off + 14] = np.clip(v[off + 14] / 1e-3, -1.0, 1.0)  # dlon
+        v[off + 15] = np.clip(v[off + 15] / 50.0, -1.0, 1.0)  # dalt
 
         v = np.clip(v, -1.0, 1.0)
         return v.astype(np.float32)
@@ -721,7 +889,7 @@ class CarlaUrbanEnv(gym.Env):
                 tl_onehot[2],  # red at index 5 by design
                 float(tl_dist),
                 gaps.front_gap,
-                gaps.front_rel_speed,
+                gaps.front_rel_speed,  # front_speed - ego_speed
                 gaps.left_front_gap,
                 gaps.left_rear_gap,
                 gaps.right_front_gap,
@@ -748,7 +916,6 @@ class CarlaUrbanEnv(gym.Env):
             route_ego = world_to_ego_frame(ego_tf, route_world)
             drivable_mask = self._rasterize_points_to_mask(drivable_ego)
 
-            # IMPORTANT: your bev_builder.py already normalizes velocities to [-1,1]
             bev = build_bev_from_tracks(tracks, drivable_mask, route_ego, self.bev_cfg)
             obs["bev"] = bev
 
@@ -776,68 +943,108 @@ class CarlaUrbanEnv(gym.Env):
             return 0.0, 0
         return target_speed, 0
 
-
     def _shield_action(self, proposed_action: int) -> int:
-        """Lightweight safety shield for training stability (option C).
-
-        It may override obviously unsafe / illegal actions, but we still penalize the
-        *decision* so the policy learns to pick safe actions itself.
-        """
+        """Safety shield with sanity checks to avoid STOP spam from noisy TTC/gap."""
         s_cfg = self.scenarios_cfg.get("shield", {}) or {}
+
+        # unified disable flag
+        if bool(getattr(self, "disable_shield", False)):
+            self._last_action_overridden = False
+            self._last_action_override_reason = "DISABLE_SHIELD"
+            return int(proposed_action)
+
         if not bool(s_cfg.get("enabled", False)):
             self._last_action_overridden = False
-            return proposed_action
+            self._last_action_override_reason = ""
+            return int(proposed_action)
 
-        # Use cached raw vec from previous observation (seconds/meters, not normalized)
         v = self._last_vec_raw
+
+        speed_mps = float(v[0])
         tl_red = float(v[5])
         tl_dist = float(v[6])
         front_gap = float(v[7])
-        left_front = float(v[9])
-        left_rear = float(v[10])
-        right_front = float(v[11])
-        right_rear = float(v[12])
+        front_rel_speed = float(v[8])  # front_speed - ego_speed
         min_ttc = float(v[13])
 
-        red_light_dist = float(s_cfg.get("red_light_dist_m", 20.0))
-        ttc_stop = float(s_cfg.get("ttc_stop_s", 1.5))
-        front_gap_stop = float(s_cfg.get("front_gap_stop_m", 6.0))
+        off = 14
+        depth_center_min_m = float(v[off + 1])
+        radar_min_range_m = float(v[off + 3])
 
-        lc_front_min = float(s_cfg.get("lane_change_min_front_gap_m", 12.0))
-        lc_rear_min = float(s_cfg.get("lane_change_min_rear_gap_m", 8.0))
-        lc_ttc_min = float(s_cfg.get("lane_change_min_ttc_s", 3.0))
+        red_light_dist = float(s_cfg.get("red_light_dist_m", 12.0))
+        ttc_stop = float(s_cfg.get("ttc_stop_s", 1.0))
+        front_gap_stop = float(s_cfg.get("front_gap_stop_m", 4.0))
+
+        lc_front_min = float(s_cfg.get("lane_change_min_front_gap_m", 10.0))
+        lc_rear_min = float(s_cfg.get("lane_change_min_rear_gap_m", 7.0))
+        lc_ttc_min = float(s_cfg.get("lane_change_min_ttc_s", 2.5))
 
         override_to = str(s_cfg.get("override_to", "STOP")).upper()
         override_action = 3 if override_to == "STOP" else 6  # STOP=3, YIELD=6
 
         overridden = False
+        reason = ""
         a = int(proposed_action)
 
-        # Rule 1: red light close -> must STOP/YIELD/CREEP
+        # closing if ego faster than front => front_rel_speed < 0
+        closing_speed = max(0.0, -front_rel_speed)
+        closing = closing_speed > 0.5
+
+        # Rule 1: red light close
         if tl_red > 0.5 and tl_dist < red_light_dist:
-            if a not in (3, 5, 6):
+            if a not in (3, 5, 6):  # STOP/CREEP/YIELD
                 a = override_action
                 overridden = True
+                reason = f"RED_LIGHT tl_dist={tl_dist:.2f}"
 
-        # Rule 2: imminent collision risk -> STOP
-        if (min_ttc > 0.0 and min_ttc < ttc_stop) or (front_gap > 0.0 and front_gap < front_gap_stop):
-            if a not in (3, 5, 6):
+        # Rule 2: stable sensor stop (depth/radar)
+        if not overridden and speed_mps > 1.0:
+            if 0.0 < depth_center_min_m < 4.0:
                 a = 3
                 overridden = True
+                reason = f"DEPTH_CLOSE depth={depth_center_min_m:.2f}"
+            elif 0.0 < radar_min_range_m < 4.5:
+                a = 3
+                overridden = True
+                reason = f"RADAR_CLOSE radar={radar_min_range_m:.2f}"
 
-        # Rule 3: lane change only if adjacent gaps are safe
-        if a == 1:  # change left
-            if (left_front < lc_front_min) or (left_rear < lc_rear_min) or (min_ttc < lc_ttc_min):
-                a = 0
+        # Rule 3: TTC/gap imminent risk with sanity checks
+        if not overridden:
+            if front_gap > 25.0:
+                ttc_is_threat = False
+            else:
+                ttc_is_threat = (min_ttc > 0.0 and min_ttc < ttc_stop and closing)
+
+            gap_is_threat = (front_gap > 0.0 and front_gap < front_gap_stop and speed_mps > 1.0)
+
+            if (ttc_is_threat or gap_is_threat) and (a not in (3, 5, 6)):
+                a = 3
                 overridden = True
-        if a == 2:  # change right
-            if (right_front < lc_front_min) or (right_rear < lc_rear_min) or (min_ttc < lc_ttc_min):
-                a = 0
-                overridden = True
+                reason = (
+                    f"IMMINENT_RISK min_ttc={min_ttc:.2f} front_gap={front_gap:.2f} closing_v={closing_speed:.2f}"
+                )
+
+        # Rule 4: lane change safety
+        if not overridden:
+            left_front = float(v[9])
+            left_rear = float(v[10])
+            right_front = float(v[11])
+            right_rear = float(v[12])
+
+            if a == 1:  # change left
+                if (left_front < lc_front_min) or (left_rear < lc_rear_min) or (min_ttc < lc_ttc_min and closing):
+                    a = 0
+                    overridden = True
+                    reason = "LC_BLOCK_LEFT"
+            elif a == 2:  # change right
+                if (right_front < lc_front_min) or (right_rear < lc_rear_min) or (min_ttc < lc_ttc_min and closing):
+                    a = 0
+                    overridden = True
+                    reason = "LC_BLOCK_RIGHT"
 
         self._last_action_overridden = overridden
-        return a
-
+        self._last_action_override_reason = reason
+        return int(a)
 
     def _choose_target_waypoint(self) -> "carla.Waypoint":
         assert self.map is not None and self.ego is not None
@@ -875,9 +1082,15 @@ class CarlaUrbanEnv(gym.Env):
                 action = 0
 
         proposed_action = int(action)
-        self._last_action = proposed_action
-        action = self._shield_action(proposed_action)
-        target_speed, lane_delta = self._apply_high_level_action(int(action))
+        self._last_action = proposed_action  # proposed for reward shaping
+
+        executed_action = int(self._shield_action(proposed_action))
+
+        # save for logging
+        self._last_proposed_action = int(proposed_action)
+        self._last_executed_action = int(executed_action)
+
+        target_speed, lane_delta = self._apply_high_level_action(executed_action)
         if lane_delta != 0:
             self._lane_target_offset = int(np.clip(self._lane_target_offset + lane_delta, -1, 1))
             self._action_cooldown = 10
@@ -891,8 +1104,15 @@ class CarlaUrbanEnv(gym.Env):
             steer = self.controller.compute_steer(wp.transform.location, self.ego.get_transform(), speed)
             throttle, brake = self.controller.compute_throttle_brake(target_speed, speed, self.dt / self.action_repeat)
 
-            control = carla.VehicleControl(steer=float(steer), throttle=float(throttle), brake=float(brake))
+            control = carla.VehicleControl(
+                steer=float(steer),
+                throttle=float(throttle),
+                brake=float(brake),
+                hand_brake=False,
+                manual_gear_shift=False,
+            )
             self.ego.apply_control(control)
+            self._last_control = control
 
             self.world.tick()
 
@@ -941,12 +1161,15 @@ class CarlaUrbanEnv(gym.Env):
             truncated = True
 
         info: Dict[str, Any] = {
-            "action_name": self.ACTIONS[int(action)],
-            "proposed_action_name": self.ACTIONS[int(getattr(self, "_last_action", int(action)))],
+            "action_name": self._safe_action_name(self._last_executed_action),
+            "proposed_action_name": self._safe_action_name(self._last_proposed_action),
             "action_overridden": bool(getattr(self, "_last_action_overridden", False)),
+            "override_reason": str(getattr(self, "_last_action_override_reason", "")),
             "collision": self.collision_happened,
             "lane_invasion": self.lane_invasion_happened,
+            "speed_mps": float(speed_mps),
         }
+
         if hasattr(self, "_last_dbg"):
             info.update(self._last_dbg)
 
@@ -979,6 +1202,29 @@ class CarlaUrbanEnv(gym.Env):
         speed = get_speed_mps(self.ego)
         lane_dist, heading_err = self._lane_metrics()
 
+        # lane id tracking + blocked detection (NEW)
+        lane_id: Optional[int] = None
+        try:
+            assert self.map is not None
+            wp = self.map.get_waypoint(
+                self.ego.get_transform().location, project_to_road=True, lane_type=carla.LaneType.Driving
+            )
+            lane_id = int(wp.lane_id) if wp is not None else None
+        except Exception:
+            lane_id = None
+
+        vraw = getattr(self, "_last_vec_raw", np.zeros(30, dtype=np.float32))
+        front_gap = float(vraw[7])
+        # front_rel_speed = front_speed - ego_speed
+        front_rel_speed = float(vraw[8])
+
+        target_speed = self.target_speed_kmh / 3.6
+        blocked = (front_gap > 0.0 and front_gap < 12.0) and (speed < target_speed - 2.0)
+        if blocked:
+            self._blocked_time += self.dt
+        else:
+            self._blocked_time = 0.0
+
         # progress: forward displacement
         tf = self.ego.get_transform()
         if self._prev_loc is None:
@@ -999,7 +1245,6 @@ class CarlaUrbanEnv(gym.Env):
             ttc_pen = (2.0 - min_ttc)
 
         # speed target
-        target_speed = self.target_speed_kmh / 3.6
         speed_err = abs(speed - target_speed)
 
         reward = 0.0
@@ -1019,9 +1264,9 @@ class CarlaUrbanEnv(gym.Env):
             reward -= float(r_cfg.get("red_light_penalty", 0.0))
 
         # -------- decision penalties (teach policy, even if shield overrides) --------
-        # Note: self._last_action is the *proposed* action before shield.
         a = int(getattr(self, "_last_action", 0))
-        if bool(getattr(self, "_last_action_overridden", False)):
+
+        if (not self.disable_shield) and bool(getattr(self, "_last_action_overridden", False)):
             reward -= float(r_cfg.get("unsafe_action_penalty", 0.0))
 
         # Red light: penalize choosing GO/KEEP/LC when red is close
@@ -1032,7 +1277,7 @@ class CarlaUrbanEnv(gym.Env):
                 reward -= float(r_cfg.get("red_light_action_penalty", 0.0))
 
         # TTC: penalize not choosing defensive action when TTC is low
-        min_ttc_raw = float(getattr(self, "_last_vec_raw", np.zeros(30, dtype=np.float32))[13])
+        min_ttc_raw = float(vraw[13])
         if min_ttc_raw > 0.0 and min_ttc_raw < 2.0:
             if a not in (3, 5, 6):
                 reward -= float(r_cfg.get("ttc_action_penalty", 0.0))
@@ -1040,5 +1285,24 @@ class CarlaUrbanEnv(gym.Env):
         # small cost for lane change to avoid oscillation
         if a in (1, 2):
             reward -= float(r_cfg.get("lane_change_penalty", 0.0))
+
+        # -------- NEW: bonus for successful lane change / overtake when blocked --------
+        # Initialize prev lane id
+        if self._prev_lane_id is None and lane_id is not None:
+            self._prev_lane_id = lane_id
+
+        changed_lane = (lane_id is not None and self._prev_lane_id is not None and lane_id != self._prev_lane_id)
+
+        # If agent attempted lane change while blocked recently, reward success if it helps
+        if a in (1, 2) and (self._blocked_time > 0.8) and changed_lane:
+            gap_improved = front_gap > (self._last_front_gap + 3.0)
+            speed_improved = speed > (target_speed - 1.0)
+            if gap_improved or speed_improved:
+                reward += float(r_cfg.get("lane_change_success_bonus", 2.0))  # default +2.0
+
+        # update caches
+        if lane_id is not None:
+            self._prev_lane_id = lane_id
+        self._last_front_gap = front_gap
 
         return float(reward)

@@ -16,13 +16,8 @@ spawn:
   spawn_point: "random"
 
 traffic:
-  enabled: true
-  seed: 1337
-  vehicles: 15
-  walkers: 0
-  hybrid_physics_mode: true
-  global_distance_to_leading_vehicle: 2.5
-  respawn_dormant_vehicles: false
+  global_distance_to_leading_vehicle: 4.0
+
 
 episode:
   max_seconds: 45
